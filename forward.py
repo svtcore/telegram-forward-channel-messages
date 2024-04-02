@@ -50,8 +50,8 @@ class Forward:
 	#Store message id from it and get message object
 	def get_target_last_post(self):
 		try:
-			target_message_history = self.app.get_history(self.target_from, limit=1)
-			self.target_last_msg_id = target_message_history[0].message_id
+			target_message_history = list(self.app.get_chat_history(self.target_from, limit=1))
+			self.target_last_msg_id = target_message_history[0].id
 			self.target_last_msg_obj = self.app.get_messages(self.target_from, self.target_last_msg_id)
 		except NameError:
 			print(NameError)
@@ -60,7 +60,7 @@ class Forward:
 	#Store last forwarded message id if doesn't exist then will have None value
 	def get_host_last_post(self):
 		try:
-			host_message_history = self.app.get_history(self.target_to, limit=1)
+			host_message_history = list(self.app.get_chat_history(self.target_to, limit=1))
 			self.host_last_msg_id = host_message_history[0].forward_from_message_id
 		except NameError:
 			print(NameError)
@@ -68,7 +68,7 @@ class Forward:
 	#Check type (text, voice, photo etc.) of message by the key if exist return true otherwise false
 	def check_key(self, key):
 		try:
-			if (self.target_last_msg_obj[key] != None):
+			if hasattr(self.target_last_msg_obj, key) and getattr(self.target_last_msg_obj, key) is not None:
 				return 1
 			else:
 				return 0
@@ -81,13 +81,15 @@ class Forward:
 	def check_message_text(self):
 		try:
 			key = None
-			if (self.target_last_msg_obj['text'] != None):
-				key = "text"
-			elif (self.target_last_msg_obj['caption'] != None):
-				key = "caption"
+			if hasattr(self.target_last_msg_obj, "text"):
+				key = self.target_last_msg_obj.text.lower()
+			elif hasattr(self.target_last_msg_obj, "caption"):
+				key = self.target_last_msg_obj.caption.lower()
+			else:
+				return 0
 			if key != None:
 				for i in range(0, len(self.words_list)):
-					if self.words_list[i].lower() in self.target_last_msg_obj[key].lower():
+					if self.words_list[i].lower() in key:
 						return 1
 				return 0
 		except NameError:
@@ -98,8 +100,8 @@ class Forward:
 	#Return true if any value from array match with file format in the post
 	def check_document_format(self):
 		try:
-			if (self.target_last_msg_obj['document'] != None):
-				file_format = self.target_last_msg_obj['document']['file_name'].split('.')
+			if (self.target_last_msg_obj.document != None):
+				file_format = self.target_last_msg_obj.document.file_name.split('.')
 				file_format = file_format[len(file_format)-1].lower()
 				for i in range(0, len(self.allowed_file_formats)):
 					if self.allowed_file_formats[i] == file_format:
