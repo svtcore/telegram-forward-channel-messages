@@ -1,6 +1,6 @@
 # Telegram Bot Forward Channel Messages
 
-Provide make backup of messages from telegram channels even if they were delete by the owner of channel or forward messages from private channels to your channel (if you have access)
+Provide make backup of messages from telegram channels even if they were delete by the owner of channel or forward messages from private channels to your channel (if you have access and owner does not restrict sharing posts)
 
 Script has forward modes:
 * all messages
