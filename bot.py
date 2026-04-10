@@ -1,31 +1,39 @@
-from forward import Forward
-import time
+import asyncio
+import logging
+import sys
 
-'''
-Forward modes
-0 - all messages
-1 - contains words
-2 - only images
-3 - only documents
-4 - only documents with special format
-5 - only audio
-6 - only video
-7 - only voice
-'''
+from config import DESTINATION, FILE_FORMATS, MODE, POLL_INTERVAL, SOURCE, WORDS
+from forward import ChannelForwarder
 
-#API ID and API hash you can find on my.telegram.org
-
-API_ID = 0 #YOUR API_ID
-API_HASH = "YOUR_API_HASH_HERE"
-mode = 0 #mode - default 0 - forward all messages
-from_channel = "iwantforwardfromhere" #channel name in url
-to_channel = "forwardtothischannel" #channel name
-words_list = ['sports', 'win', 'funny', 'http', 'https'] #if you use mode №1, it will forward only messages if they contains any of these words
-allowed_file_formats = ['rar', 'zip', '7z'] #if you use mode №4, it will forward only messages if they have any of these file formats
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
-fwd = Forward(mode, from_channel, to_channel, words_list, allowed_file_formats, API_ID, API_HASH)
-fwd.auth() #auth through pytrogram
-while True:
-	fwd.start()
-	time.sleep(5) #delay while checking new posts
+async def main():
+    full_sync = "--sync" in sys.argv
+
+    fwd = ChannelForwarder(
+        source=SOURCE,
+        destination=DESTINATION,
+        mode=MODE,
+        words=WORDS,
+        file_formats=FILE_FORMATS,
+    )
+    try:
+        await fwd.start()
+        if full_sync:
+            count = await fwd.forward_all()
+            print(f"\nDone! Forwarded {count} message(s)")
+        else:
+            await fwd.run_polling(interval=POLL_INTERVAL)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await fwd.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
