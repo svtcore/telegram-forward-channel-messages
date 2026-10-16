@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -15,7 +16,7 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
-from pyrogram import Client, enums
+from pyrogram import Client, enums, raw
 from pyrogram.errors import ChatForwardsRestricted, FloodWait, RPCError
 from pyrogram.types import (
     InputMediaAudio,
@@ -51,6 +52,28 @@ MIB = 1024 * 1024
 STANDARD_UPLOAD_LIMIT_MIB = 2000
 PREMIUM_UPLOAD_LIMIT_MIB = 4000
 SEVEN_ZIP_VOLUME_MIB = 1990
+
+
+def _apply_pyrofork_media_group_compatibility() -> None:
+    """Supply the empty topics vector omitted by Pyrofork 2.3.69."""
+    messages_type = raw.types.messages.Messages
+    original_init = messages_type.__init__
+    if getattr(original_init, "_tgfwd_topics_compat", False):
+        return
+
+    topics = inspect.signature(original_init).parameters.get("topics")
+    if topics is None or topics.default is not inspect.Parameter.empty:
+        return
+
+    def compatible_init(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("topics", [])
+        original_init(self, *args, **kwargs)
+
+    compatible_init._tgfwd_topics_compat = True  # type: ignore[attr-defined]
+    messages_type.__init__ = compatible_init
+
+
+_apply_pyrofork_media_group_compatibility()
 
 
 class ForwardMode(IntEnum):
