@@ -27,8 +27,6 @@ _RE_PRIVATE = re.compile(r"https?://t\.me/c/(\d+)(?:/\d+)?/?$")
 DESKTOP_API_ID = 2040
 DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-SESSION_NAME = "account"
-
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
@@ -63,12 +61,14 @@ class ChannelForwarder:
         mode: ForwardMode = ForwardMode.ALL,
         words: list[str] | None = None,
         file_formats: list[str] | None = None,
+        session_name: str = "account",
     ):
         self._source_input = source
         self._destination_input = destination
         self.mode = mode
         self.words = [w.lower() for w in (words or [])]
         self.file_formats = [f.lower() for f in (file_formats or [])]
+        self.session_name = session_name
 
         self.app: Client | None = None
         self._source_id: int = 0
@@ -83,7 +83,7 @@ class ChannelForwarder:
     async def start(self) -> None:
         """Authenticate, resolve source/destination, detect protection"""
         self.app = Client(
-            SESSION_NAME,
+            self.session_name,
             api_id=DESKTOP_API_ID,
             api_hash=DESKTOP_API_HASH,
         )
@@ -133,7 +133,9 @@ class ChannelForwarder:
             # Private invite link — first try get_chat, then join_chat
             try:
                 chat = await self.app.get_chat(identifier)
-                return chat.id
+                chat_id = getattr(chat, "id", None)
+                if chat_id is not None:
+                    return chat_id
             except (RPCError, KeyError, ValueError):
                 pass
             chat = await self.app.join_chat(identifier)
