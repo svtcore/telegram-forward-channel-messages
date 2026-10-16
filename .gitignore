@@ -1,5 +1,7 @@
 *.session
 *.session-journal
+.clone-state.sqlite3*
+.clone-temp/
 .env
 __pycache__/
 *.pyc
