@@ -1,17 +1,13 @@
-﻿# Telegram Forward Channel Messages
+# Telegram Channel Message Forwarder
 
-A tool for forwarding messages between Telegram channels. Supports public and private channels, protected content (automatic download + re-upload fallback), media groups (albums), and flexible content filtering
+A Python utility for forwarding messages between Telegram channels using a Telegram user account. It supports public and private channels, media, albums, protected content, and message filtering.
 
-> **Note:** This tool uses a Telegram user account (not a bot) via the MTProto API. Use a dedicated or test account
-
----
+> This tool uses the Telegram MTProto API with a user account, not a bot. A dedicated account is recommended.
 
 ## Requirements
 
 - Python 3.10+
-- A Telegram account (used to make API requests)
-
----
+- A Telegram account
 
 ## Installation
 
@@ -19,153 +15,92 @@ A tool for forwarding messages between Telegram channels. Supports public and pr
 pip install -r requirements.txt
 ```
 
----
+Create the local configuration file:
 
-## Setup
-
-### 1. Create the local configuration
-
-Copy the example file and edit `.env`:
-
-```powershell
-Copy-Item .env.example .env
+```terminal
+cp .env.example .env
 ```
 
-At minimum, set the source and destination channels:
+Set at least the source, destination, and forwarding mode:
 
 ```dotenv
 SOURCE=https://t.me/source_channel
-DESTINATION=https://t.me/+invite_hash
-```
-
-The `.env` file is ignored by Git, so account-specific settings and private
-invite links are not committed to the repository.
-
-Supported link formats:
-
-| Format | Type |
-|---|---|
-| `https://t.me/username` | Public channel |
-| `https://t.me/+InviteHash` | Private channel (invite link) |
-| `https://t.me/c/1234567890` | Private channel (numeric ID) |
-| `Channel Title` | Search by name in your dialogs |
-
-### 2. Set the content filter
-
-```dotenv
+DESTINATION=https://t.me/destination_channel
 FORWARD_MODE=ALL
 ```
 
-| Mode | Description |
-|---|---|
-| `ALL` | All messages |
-| `WORDS` | Messages containing specified keywords |
-| `PHOTO` | Photos only |
-| `DOCUMENT` | Documents only |
-| `DOCUMENT_FORMAT` | Documents with specified file extensions |
-| `AUDIO` | Audio files only |
-| `VIDEO` | Videos only |
-| `VOICE` | Voice messages only |
+Channels can be specified by public link, private invite link, numeric private link (`https://t.me/c/...`), or dialog name.
 
-For `WORDS` mode, specify keywords:
+## Filtering
+
+Set `FORWARD_MODE` to one of the following values:
+
+| Mode | Description |
+| --- | --- |
+| `ALL` | Forward all messages |
+| `WORDS` | Forward messages containing one of the configured keywords |
+| `PHOTO` | Forward photos only |
+| `DOCUMENT` | Forward documents only |
+| `DOCUMENT_FORMAT` | Forward documents with selected file extensions |
+| `AUDIO` | Forward audio files only |
+| `VIDEO` | Forward videos only |
+| `VOICE` | Forward voice messages only |
 
 ```dotenv
 WORDS=keyword1,keyword2
+FILE_FORMATS=pdf,zip
+POLL_INTERVAL=5
 ```
 
-For `DOCUMENT_FORMAT` mode, specify extensions:
-
-```dotenv
-FILE_FORMATS=pdf,zip,rar
-```
-
----
+Use `WORDS` with `FORWARD_MODE=WORDS` and `FILE_FORMATS` with `FORWARD_MODE=DOCUMENT_FORMAT`.
 
 ## Usage
 
-Run the application:
+Start the application interactively:
 
 ```bash
 python bot.py
 ```
 
-It will ask which operating mode to use:
+The application provides two modes:
 
-```text
-Choose run mode:
-  1. Observer  - wait for new messages
-  2. One-time  - process available history once and exit
-Mode [1]:
-```
+- `Observer` — wait for and forward new messages.
+- `One-time` — process channel history once and exit.
 
-Press Enter to select Observer by default.
-
-### Observer mode
-
-Starts at the latest source message, waits for new messages, and forwards them
-until the application is stopped with `Ctrl+C`.
-
-The polling interval is configured in `.env`:
-
-```dotenv
-POLL_INTERVAL=5
-```
-
-To skip the interactive menu:
+Run a mode directly:
 
 ```bash
 python bot.py --observer
-```
-
-### One-time mode
-
-Forwards the entire history of the source channel to the destination. Messages already present in the destination are skipped automatically
-
-```bash
 python bot.py --one-time
 ```
 
-The former `--sync` option remains available as an alias for `--one-time`.
+For one-time runs, choose one of these functions:
 
-### First run
+| Function | Description |
+| --- | --- |
+| `full-clone` | Process the complete available source history. |
+| `from-post` | Process messages from the specified post through the latest post. |
+| `single-post` | Process only the specified post. Albums are kept together. |
 
-On first launch, Pyrogram will ask you to authorize your Telegram account (phone number + confirmation code). A session file `account.session` will be created - subsequent runs will not require re-authorization
+Choose a delivery strategy explicitly:
 
----
+- `forward` - use Telegram's native forwarding when available.
+- `reupload` - download and send the content again; this also supports protected content.
 
-## Forwarding strategy
+Examples:
 
-For each message the tool attempts the following in order:
-
-1. **Direct forward** - native Telegram forward (includes "Forwarded from" header)
-2. **Server-side copy** - copy without the "Forwarded from" header
-3. **Manual re-upload** - downloads media locally and re-sends it (used when the source channel has content protection enabled)
-
-Fallback to the next strategy happens automatically
-
----
-
-## Project Structure
-
-```
-- bot.py             # Entry point and interactive run-mode menu
-- config.py          # Loads and validates environment configuration
-- .env.example       # Safe configuration template
-- .env               # Local configuration (not committed)
-- forward.py         # Core logic - forwarding, filtering, fallback
-- requirements.txt   # Python dependencies
-- account.session    # Pyrogram session file (auto-created on first run)
+```bash
+python bot.py --one-time --function full-clone --strategy forward
+python bot.py --one-time --function from-post --start-post https://t.me/source_channel/123 --strategy reupload
+python bot.py --one-time --function single-post --post https://t.me/source_channel/123 --strategy reupload
 ```
 
----
+On the first run, Pyrogram will request your phone number and confirmation code, then create `account.session` for subsequent runs.
 
-## Disclaimer
+## Notes
 
-This project is provided for educational and personal use only. The author is not responsible for any misuse, legal issues, or damages caused by using this tool.
-
-Users are solely responsible for their own actions. Telegram may block or limit accounts that violate its policies.
-
----
+- The `--sync` option is retained as an alias for `--one-time`.
+- You are responsible for complying with Telegram's terms and applicable copyright laws.
 
 ## License
 
