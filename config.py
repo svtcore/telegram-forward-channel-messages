@@ -1,27 +1,69 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
 from forward import ForwardMode
 
-# Source channel (public link, private invite link, or chat title)
-SOURCE = "https://t.me/channel_name_from_which_to_forward"
 
-# Destination channel (public link, private invite link, or chat title)
-DESTINATION = "https://t.me/channel_name_for_forwarding_to"
+@dataclass(frozen=True)
+class Config:
+    source: str
+    destination: str
+    forward_mode: ForwardMode
+    words: list[str]
+    file_formats: list[str]
+    poll_interval: float
+    session_name: str
 
-# Forwarding mode
-#   ForwardMode.ALL             - all messages
-#   ForwardMode.WORDS           - messages containing specified words
-#   ForwardMode.PHOTO           - only photos
-#   ForwardMode.DOCUMENT        - only documents
-#   ForwardMode.DOCUMENT_FORMAT - documents with specified extensions
-#   ForwardMode.AUDIO           - only audio
-#   ForwardMode.VIDEO           - only video
-#   ForwardMode.VOICE           - only voice messages
-MODE = ForwardMode.ALL
 
-# Keywords for ForwardMode.WORDS
-WORDS = ["sport", "internet", "meme"]
+def _csv(name: str) -> list[str]:
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
 
-# File extensions for ForwardMode.DOCUMENT_FORMAT
-FILE_FORMATS = ["pdf", "zip", "rar"]
 
-# Polling interval in seconds (for monitoring mode)
-POLL_INTERVAL = 5.0
+def _forward_mode() -> ForwardMode:
+    value = os.getenv("FORWARD_MODE", "ALL").strip().upper()
+    try:
+        return ForwardMode[value]
+    except KeyError as exc:
+        available = ", ".join(mode.name for mode in ForwardMode)
+        raise ValueError(
+            f"Unknown FORWARD_MODE={value!r}. Available modes: {available}"
+        ) from exc
+
+
+def load_config() -> Config:
+    """Load and validate application settings from a local .env file."""
+    load_dotenv()
+
+    source = os.getenv("SOURCE", "").strip()
+    destination = os.getenv("DESTINATION", "").strip()
+    missing = [
+        name
+        for name, value in (("SOURCE", source), ("DESTINATION", destination))
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            f"Missing required setting(s): {', '.join(missing)}. "
+            "Copy .env.example to .env and fill in the values."
+        )
+
+    try:
+        poll_interval = float(os.getenv("POLL_INTERVAL", "5"))
+    except ValueError as exc:
+        raise ValueError("POLL_INTERVAL must be a number") from exc
+    if poll_interval <= 0:
+        raise ValueError("POLL_INTERVAL must be greater than zero")
+
+    return Config(
+        source=source,
+        destination=destination,
+        forward_mode=_forward_mode(),
+        words=_csv("WORDS"),
+        file_formats=_csv("FILE_FORMATS"),
+        poll_interval=poll_interval,
+        session_name=os.getenv("SESSION_NAME", "account").strip() or "account",
+    )

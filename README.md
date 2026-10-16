@@ -23,14 +23,23 @@ pip install -r requirements.txt
 
 ## Setup
 
-### 1. Configure source and destination
+### 1. Create the local configuration
 
-Open `config.py` and set the channels:
+Copy the example file and edit `.env`:
 
-```python
-SOURCE = "https://t.me/source_channel"       # channel to forward from
-DESTINATION = "https://t.me/+invite_hash"     # channel to forward to
+```powershell
+Copy-Item .env.example .env
 ```
+
+At minimum, set the source and destination channels:
+
+```dotenv
+SOURCE=https://t.me/source_channel
+DESTINATION=https://t.me/+invite_hash
+```
+
+The `.env` file is ignored by Git, so account-specific settings and private
+invite links are not committed to the repository.
 
 Supported link formats:
 
@@ -41,10 +50,10 @@ Supported link formats:
 | `https://t.me/c/1234567890` | Private channel (numeric ID) |
 | `Channel Title` | Search by name in your dialogs |
 
-### 2. Set filter mode
+### 2. Set the content filter
 
-```python
-MODE = ForwardMode.ALL
+```dotenv
+FORWARD_MODE=ALL
 ```
 
 | Mode | Description |
@@ -60,41 +69,63 @@ MODE = ForwardMode.ALL
 
 For `WORDS` mode, specify keywords:
 
-```python
-WORDS = ["keyword1", "keyword2"]
+```dotenv
+WORDS=keyword1,keyword2
 ```
 
 For `DOCUMENT_FORMAT` mode, specify extensions:
 
-```python
-FILE_FORMATS = ["pdf", "zip", "rar"]
+```dotenv
+FILE_FORMATS=pdf,zip,rar
 ```
 
 ---
 
 ## Usage
 
-### Full sync
-
-Forwards the entire history of the source channel to the destination. Messages already present in the destination are skipped automatically
-
-```bash
-python bot.py --sync
-```
-
-### Monitor mode
-
-Polls the source channel at a regular interval and forwards any new messages as they appear.
+Run the application:
 
 ```bash
 python bot.py
 ```
 
-Polling interval is configured in `config.py`:
+It will ask which operating mode to use:
 
-```python
-POLL_INTERVAL = 5.0  # seconds
+```text
+Choose run mode:
+  1. Observer  - wait for new messages
+  2. One-time  - process available history once and exit
+Mode [1]:
 ```
+
+Press Enter to select Observer by default.
+
+### Observer mode
+
+Starts at the latest source message, waits for new messages, and forwards them
+until the application is stopped with `Ctrl+C`.
+
+The polling interval is configured in `.env`:
+
+```dotenv
+POLL_INTERVAL=5
+```
+
+To skip the interactive menu:
+
+```bash
+python bot.py --observer
+```
+
+### One-time mode
+
+Forwards the entire history of the source channel to the destination. Messages already present in the destination are skipped automatically
+
+```bash
+python bot.py --one-time
+```
+
+The former `--sync` option remains available as an alias for `--one-time`.
 
 ### First run
 
@@ -117,8 +148,10 @@ Fallback to the next strategy happens automatically
 ## Project Structure
 
 ```
-- bot.py             # Entry point - sync or polling mode
-- config.py          # Configuration: channels, mode, filter settings
+- bot.py             # Entry point and interactive run-mode menu
+- config.py          # Loads and validates environment configuration
+- .env.example       # Safe configuration template
+- .env               # Local configuration (not committed)
 - forward.py         # Core logic - forwarding, filtering, fallback
 - requirements.txt   # Python dependencies
 - account.session    # Pyrogram session file (auto-created on first run)
