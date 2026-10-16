@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -17,10 +18,31 @@ class Config:
     file_formats: list[str]
     poll_interval: float
     session_name: str
+    clone_state_file: str
+    temp_download_dir: str
+    seven_zip_path: str | None
 
 
 def _csv(name: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def _project_path(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip() or default
+    path = Path(os.path.expandvars(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return str(path.resolve())
+
+
+def _optional_project_path(name: str) -> str | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    path = Path(os.path.expandvars(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return str(path.resolve())
 
 
 def _forward_mode() -> ForwardMode:
@@ -66,4 +88,10 @@ def load_config() -> Config:
         file_formats=_csv("FILE_FORMATS"),
         poll_interval=poll_interval,
         session_name=os.getenv("SESSION_NAME", "account").strip() or "account",
+        clone_state_file=(
+            os.getenv("CLONE_STATE_FILE", ".clone-state.sqlite3").strip()
+            or ".clone-state.sqlite3"
+        ),
+        temp_download_dir=_project_path("TEMP_DOWNLOAD_DIR", ".clone-temp"),
+        seven_zip_path=_optional_project_path("SEVEN_ZIP_PATH"),
     )
