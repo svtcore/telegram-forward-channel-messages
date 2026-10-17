@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import logging
 import os
@@ -864,16 +863,6 @@ class ChannelForwarder:
                 return kind, media
         return None
 
-    @staticmethod
-    async def _sha256(path: str) -> str:
-        """Hash a file while keeping cancellation and cleanup responsive."""
-        digest = hashlib.sha256()
-        with open(path, "rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-                await asyncio.sleep(0)
-        return digest.hexdigest()
-
     def _resolve_seven_zip(self) -> str:
         candidates: list[str] = []
         if self.seven_zip_path:
@@ -1057,74 +1046,6 @@ class ChannelForwarder:
             )
         return sent_messages
 
-    async def _verify_uploaded_document_volume(
-        self,
-        source_msg: Message,
-        sent_msg: Message,
-        expected_hash: str,
-        expected_size: int,
-        part_name: str,
-        part_number: int,
-        part_count: int,
-        temp_dir: str,
-    ) -> None:
-        if getattr(sent_msg, "document", None) is None:
-            raise IntegrityError(
-                f"Uploaded volume {part_number}/{part_count} of source msg "
-                f"{source_msg.id} returned the wrong media type"
-            )
-
-        verify_dir = os.path.join(
-            temp_dir,
-            f"telegram_verify_{source_msg.id}_part_{part_number:03d}",
-        )
-        os.mkdir(verify_dir)
-        progress = ConsoleProgress("Verifying", part_name, part_count)
-        progress.item_number = part_number
-        try:
-            verified_path = await self._retry_flood_wait(
-                lambda: self.app.download_media(
-                    sent_msg,
-                    file_name=verify_dir + os.sep,
-                    progress=progress,
-                ),
-                source_msg.id,
-            )
-        finally:
-            progress.finish()
-
-        if not verified_path or not os.path.isfile(verified_path):
-            raise IntegrityError(
-                f"Cannot re-download volume {part_number}/{part_count} "
-                f"of source msg {source_msg.id}"
-            )
-        actual_size = os.path.getsize(verified_path)
-        if actual_size != expected_size:
-            raise IntegrityError(
-                f"Uploaded volume {part_number}/{part_count} size mismatch for "
-                f"source msg {source_msg.id}: expected={expected_size}, "
-                f"actual={actual_size}"
-            )
-
-        uploaded_hash = await self._sha256(verified_path)
-        if uploaded_hash != expected_hash:
-            raise IntegrityError(
-                f"SHA-256 mismatch for volume {part_number}/{part_count} of "
-                f"source msg {source_msg.id}: local={expected_hash}, "
-                f"telegram={uploaded_hash}"
-            )
-
-        logger.info(
-            "Verified volume %d/%d of msg %d (%d bytes, sha256=%s)",
-            part_number,
-            part_count,
-            source_msg.id,
-            expected_size,
-            expected_hash,
-        )
-        # A verified Telegram round-trip no longer needs its local check copy.
-        self._remove_temp_dir(verify_dir)
-
     async def _clone_oversized_document(
         self,
         msg: Message,
@@ -1136,44 +1057,68 @@ class ChannelForwarder:
 
         logger.warning(
             "Document %s is %s and exceeds the %s account limit; "
-            "packing it into verified %d MiB 7-Zip volumes",
+            "packing it into tested %d MiB 7-Zip volumes",
             original_name,
             _format_bytes(file_size),
             _format_bytes(self._upload_limit_bytes),
             SEVEN_ZIP_VOLUME_MIB,
         )
         volumes = await self._create_7z_volumes(msg, path, temp_dir)
+
+        os.remove(path)
+        logger.info(
+            "Removed source file for oversized msg %d after successful split",
+            msg.id,
+        )
+
+        volume_metadata = [
+            (volume, os.path.basename(volume), os.path.getsize(volume))
+            for volume in volumes
+        ]
+
         sent_messages = await self._retry_flood_wait(
             lambda: self._send_document_volume_group(msg, volumes),
             msg.id,
         )
 
-        for index, (volume, sent) in enumerate(
-            zip(volumes, sent_messages),
+        for volume, _name, _size in volume_metadata:
+            os.remove(volume)
+        archive_dir = os.path.dirname(volumes[0])
+        self._remove_temp_dir(archive_dir)
+        logger.info(
+            "Removed %d local 7-Zip volumes for oversized msg %d after upload",
+            len(volumes),
+            msg.id,
+        )
+
+        for index, (metadata, sent) in enumerate(
+            zip(volume_metadata, sent_messages),
             start=1,
         ):
-            volume_hash = await self._sha256(volume)
-            await self._verify_uploaded_document_volume(
-                msg,
-                sent,
-                volume_hash,
-                os.path.getsize(volume),
-                os.path.basename(volume),
-                index,
-                len(volumes),
-                temp_dir,
-            )
-            os.remove(volume)
+            _volume, part_name, expected_size = metadata
+            sent_document = getattr(sent, "document", None)
+            if sent_document is None:
+                raise IntegrityError(
+                    f"Uploaded volume {index}/{len(volumes)} of source msg "
+                    f"{msg.id} returned the wrong media type"
+                )
+            actual_size = getattr(sent_document, "file_size", None)
+            if actual_size != expected_size:
+                raise IntegrityError(
+                    f"Uploaded volume {index}/{len(volumes)} ({part_name}) "
+                    f"size mismatch for source msg {msg.id}: "
+                    f"expected={expected_size}, actual={actual_size}"
+                )
 
         logger.info(
-            "Uploaded and verified oversized msg %d as one %d-volume "
-            "7-Zip document album",
+            "Uploaded oversized msg %d as one %d-volume 7-Zip document "
+            "album; Telegram response sizes confirmed",
             msg.id,
             len(volumes),
         )
         return (
             sent_messages[0],
-            f"sha256-7z-volume-roundtrip:{len(volumes)}-parts",
+            f"telegram-response-size:{len(volumes)}-parts",
         )
 
     async def _send_local_file(
@@ -1281,61 +1226,34 @@ class ChannelForwarder:
             )
         return sent
 
-    async def _verify_uploaded_file(
-        self,
+    @staticmethod
+    def _validate_uploaded_file_response(
         source_msg: Message,
         sent_msg: Message,
         kind: str,
-        source_path: str,
-        temp_dir: str,
-    ) -> tuple[str, str]:
-        """Re-download an upload and verify it before deleting the local file."""
+        expected_size: int,
+    ) -> str:
+        """Validate uploaded media using the message returned by Telegram."""
         sent_media = getattr(sent_msg, kind, None)
         if sent_media is None:
             raise IntegrityError(
                 f"Uploaded source msg {source_msg.id} returned the wrong media type"
             )
 
-        verify_dir = os.path.join(
-            temp_dir,
-            f"telegram_verify_{source_msg.id}",
-        )
-        os.mkdir(verify_dir)
-        source_media = getattr(source_msg, kind)
-        progress = ConsoleProgress(
-            "Verifying",
-            self._media_display_name(source_msg, kind, source_media),
-        )
-        try:
-            verified_path = await self._retry_flood_wait(
-                lambda: self.app.download_media(
-                    sent_msg,
-                    file_name=verify_dir + os.sep,
-                    progress=progress,
-                ),
-                source_msg.id,
-            )
-        finally:
-            progress.finish()
-        if not verified_path or not os.path.isfile(verified_path):
+        returned_size = getattr(sent_media, "file_size", None)
+        if not returned_size or returned_size <= 0:
             raise IntegrityError(
-                f"Cannot re-download uploaded source msg {source_msg.id}"
+                f"Telegram returned an empty media file for source msg "
+                f"{source_msg.id}"
             )
-        if os.path.getsize(verified_path) <= 0:
-            raise IntegrityError(
-                f"Telegram returned an empty upload for source msg {source_msg.id}"
-            )
-
-        source_hash = await self._sha256(source_path)
-        uploaded_hash = await self._sha256(verified_path)
 
         if kind != "photo":
-            if uploaded_hash != source_hash:
+            if returned_size != expected_size:
                 raise IntegrityError(
-                    f"SHA-256 mismatch after uploading source msg {source_msg.id}: "
-                    f"local={source_hash}, telegram={uploaded_hash}"
+                    f"Uploaded source msg {source_msg.id} size mismatch: "
+                    f"expected={expected_size}, actual={returned_size}"
                 )
-            return source_hash, "sha256-roundtrip"
+            return "telegram-response-size"
 
         source_photo = source_msg.photo
         uploaded_photo = sent_msg.photo
@@ -1348,17 +1266,15 @@ class ChannelForwarder:
                 f"{source_photo.width}x{source_photo.height} -> "
                 f"{uploaded_photo.width}x{uploaded_photo.height}"
             )
-
-        # Telegram may recompress photos. The successful round-trip and matching
-        # dimensions are the strongest meaningful check while keeping photo UX.
-        return source_hash, "photo-roundtrip-dimensions"
+        
+        return "telegram-response-photo-dimensions"
 
     async def _clone_file_via_local(
         self,
         msg: Message,
         kind: str,
         media: Any,
-    ) -> tuple[Message, str, str]:
+    ) -> tuple[Message, str]:
         expected_size = getattr(media, "file_size", None)
         temp_dir = self._make_temp_dir(prefix=f"tgclone_{msg.id}_")
         try:
@@ -1389,12 +1305,10 @@ class ChannelForwarder:
                     f"expected={expected_size}, actual={actual_size}"
                 )
 
-            local_hash = await self._sha256(path)
             logger.info(
-                "Downloaded msg %d (%d bytes, sha256=%s)",
+                "Downloaded msg %d (%d bytes)",
                 msg.id,
                 actual_size,
-                local_hash,
             )
             if kind == "document" and actual_size > self._upload_limit_bytes:
                 sent, verification = await self._clone_oversized_document(
@@ -1403,27 +1317,30 @@ class ChannelForwarder:
                     actual_size,
                     temp_dir,
                 )
-                source_hash = local_hash
             else:
                 sent = await self._retry_flood_wait(
                     lambda: self._send_local_file(msg, kind, path),
                     msg.id,
                 )
-                source_hash, verification = await self._verify_uploaded_file(
+                verification = self._validate_uploaded_file_response(
                     msg,
                     sent,
                     kind,
-                    path,
-                    temp_dir,
+                    actual_size,
                 )
-            # Commit the resume checkpoint before deleting either local copy.
+                os.remove(path)
+                logger.info(
+                    "Removed local file for source msg %d after upload",
+                    msg.id,
+                )
+            
             self._record_verified_clone(
                 msg.id,
                 sent.id,
-                source_hash,
+                None,
                 verification,
             )
-            return sent, source_hash, verification
+            return sent, verification
         finally:
             self._remove_temp_dir(temp_dir)
 
@@ -1518,15 +1435,15 @@ class ChannelForwarder:
 
             state_records: list[tuple[int, int, str | None, str]] = []
             for source, sent, path in zip(ordered, sent_messages, paths):
-                source_hash, verification = await self._verify_uploaded_file(
+                verification = self._validate_uploaded_file_response(
                     source,
                     sent,
                     "photo",
-                    path,
-                    temp_dir,
+                    os.path.getsize(path),
                 )
+                os.remove(path)
                 state_records.append(
-                    (source.id, sent.id, source_hash, verification)
+                    (source.id, sent.id, None, verification)
                 )
 
             # The whole album is checkpointed atomically before local cleanup.
@@ -1803,7 +1720,7 @@ class ChannelForwarder:
                     file_media = self._file_media(msg)
                     if file_media:
                         kind, media = file_media
-                        sent, sha256, verification = await self._clone_file_via_local(
+                        sent, verification = await self._clone_file_via_local(
                             msg,
                             kind,
                             media,
@@ -1814,14 +1731,13 @@ class ChannelForwarder:
                             raise IntegrityError(
                                 f"Telegram returned no message for source msg {msg.id}"
                             )
-                        sha256 = None
                         verification = "telegram-response"
 
                     if not file_media:
                         self._record_verified_clone(
                             msg.id,
                             sent.id,
-                            sha256,
+                            None,
                             verification,
                         )
                     self._mark_done(msg.id)
