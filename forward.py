@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from pyrogram import Client, enums, raw
-from pyrogram.errors import ChatForwardsRestricted, FloodWait, RPCError
+from pyrogram.errors import (
+    ChatForwardsRestricted,
+    FileReferenceExpired,
+    FloodWait,
+    RPCError,
+)
 from pyrogram.types import (
     InputMediaAudio,
     InputMediaDocument,
@@ -51,6 +56,7 @@ MIB = 1024 * 1024
 STANDARD_UPLOAD_LIMIT_MIB = 2000
 PREMIUM_UPLOAD_LIMIT_MIB = 4000
 SEVEN_ZIP_VOLUME_MIB = 1990
+DOWNLOAD_ATTEMPTS = 3
 
 
 def _apply_pyrofork_media_group_compatibility() -> None:
@@ -846,6 +852,23 @@ class ChannelForwarder:
                 )
                 await asyncio.sleep(wait)
 
+    async def _refresh_source_message(self, message_id: int) -> Message:
+        """Fetch a fresh message containing a current Telegram file reference."""
+        message = await self._retry_flood_wait(
+            lambda: self.app.get_messages(
+                self._source_id,
+                message_id,
+                replies=0,
+            ),
+            message_id,
+        )
+        if message is None or getattr(message, "empty", False):
+            raise IntegrityError(
+                f"Source message {message_id} disappeared while refreshing "
+                "its file reference"
+            )
+        return message
+
     @staticmethod
     def _file_media(msg: Message) -> tuple[str, Any] | None:
         for kind in (
@@ -1275,35 +1298,68 @@ class ChannelForwarder:
         kind: str,
         media: Any,
     ) -> tuple[Message, str]:
-        expected_size = getattr(media, "file_size", None)
-        temp_dir = self._make_temp_dir(prefix=f"tgclone_{msg.id}_")
+        current_msg = msg
+        temp_dir: str | None = None
+        path: str | None = None
+        actual_size = 0
         try:
-            progress = ConsoleProgress(
-                "Downloading",
-                self._media_display_name(msg, kind, media),
-            )
-            try:
-                path = await self._retry_flood_wait(
-                    lambda: self.app.download_media(
-                        msg,
-                        file_name=temp_dir + os.sep,
-                        progress=progress,
-                    ),
-                    msg.id,
+            for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                temp_dir = self._make_temp_dir(prefix=f"tgclone_{msg.id}_")
+                current_media = getattr(current_msg, kind)
+                expected_size = getattr(current_media, "file_size", None)
+                progress = ConsoleProgress(
+                    "Downloading",
+                    self._media_display_name(current_msg, kind, current_media),
                 )
-            finally:
-                progress.finish()
-            if not path or not os.path.isfile(path):
-                raise IntegrityError(f"Download failed for source msg {msg.id}")
+                try:
+                    try:
+                        path = await self._retry_flood_wait(
+                            lambda: self.app.download_media(
+                                current_msg,
+                                file_name=temp_dir + os.sep,
+                                progress=progress,
+                            ),
+                            msg.id,
+                        )
+                    finally:
+                        progress.finish()
 
-            actual_size = os.path.getsize(path)
-            if actual_size <= 0:
-                raise IntegrityError(f"Downloaded an empty file for source msg {msg.id}")
-            if expected_size and actual_size != expected_size:
-                raise IntegrityError(
-                    f"Downloaded size mismatch for source msg {msg.id}: "
-                    f"expected={expected_size}, actual={actual_size}"
-                )
+                    if not path or not os.path.isfile(path):
+                        raise IntegrityError(
+                            f"Download failed for source msg {msg.id}"
+                        )
+                    actual_size = os.path.getsize(path)
+                    if actual_size <= 0:
+                        raise IntegrityError(
+                            f"Downloaded an empty file for source msg {msg.id}"
+                        )
+                    if expected_size and actual_size != expected_size:
+                        raise IntegrityError(
+                            f"Downloaded size mismatch for source msg {msg.id}: "
+                            f"expected={expected_size}, actual={actual_size}"
+                        )
+                    break
+                except (FileReferenceExpired, IntegrityError) as exc:
+                    self._remove_temp_dir(temp_dir)
+                    temp_dir = None
+                    path = None
+                    if attempt == DOWNLOAD_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "Download attempt %d/%d failed for source msg %d: %s; "
+                        "removed temporary files for this message and retrying "
+                        "this file only",
+                        attempt,
+                        DOWNLOAD_ATTEMPTS,
+                        msg.id,
+                        exc,
+                    )
+                    # A truncated download may be how an expired reference
+                    # manifests, so refresh after either retryable failure.
+                    current_msg = await self._refresh_source_message(msg.id)
+                    await asyncio.sleep(1)
+
+            assert temp_dir is not None and path is not None
 
             logger.info(
                 "Downloaded msg %d (%d bytes)",
@@ -1312,18 +1368,18 @@ class ChannelForwarder:
             )
             if kind == "document" and actual_size > self._upload_limit_bytes:
                 sent, verification = await self._clone_oversized_document(
-                    msg,
+                    current_msg,
                     path,
                     actual_size,
                     temp_dir,
                 )
             else:
                 sent = await self._retry_flood_wait(
-                    lambda: self._send_local_file(msg, kind, path),
+                    lambda: self._send_local_file(current_msg, kind, path),
                     msg.id,
                 )
                 verification = self._validate_uploaded_file_response(
-                    msg,
+                    current_msg,
                     sent,
                     kind,
                     actual_size,
@@ -1342,7 +1398,8 @@ class ChannelForwarder:
             )
             return sent, verification
         finally:
-            self._remove_temp_dir(temp_dir)
+            if temp_dir is not None:
+                self._remove_temp_dir(temp_dir)
 
     async def _clone_photo_album_via_local(
         self,
@@ -1350,6 +1407,7 @@ class ChannelForwarder:
     ) -> list[Message]:
         """Download and upload one complete photo post as a media group."""
         ordered = sorted(messages, key=lambda item: item.id)
+        current_messages = list(ordered)
         temp_dir = self._make_temp_dir(
             prefix=f"tgclone_album_{ordered[0].media_group_id}_"
         )
@@ -1357,47 +1415,84 @@ class ChannelForwarder:
         media_inputs: list[InputMediaPhoto] = []
 
         try:
-            for message in ordered:
-                download_dir = os.path.join(temp_dir, f"source_{message.id}")
-                os.mkdir(download_dir)
-                progress = ConsoleProgress(
-                    "Downloading",
-                    self._media_display_name(
-                        message,
-                        "photo",
-                        message.photo,
-                    ),
-                )
-                try:
-                    path = await self._retry_flood_wait(
-                        lambda message=message, download_dir=download_dir: (
-                            self.app.download_media(
-                                message,
-                                file_name=download_dir + os.sep,
-                                progress=progress,
-                            )
+            for index, original_message in enumerate(ordered):
+                message = current_messages[index]
+                path: str | None = None
+
+                for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                    download_dir = os.path.join(
+                        temp_dir,
+                        f"source_{original_message.id}",
+                    )
+                    os.mkdir(download_dir)
+                    progress = ConsoleProgress(
+                        "Downloading",
+                        self._media_display_name(
+                            message,
+                            "photo",
+                            message.photo,
                         ),
-                        message.id,
                     )
-                finally:
-                    progress.finish()
-                if not path or not os.path.isfile(path):
-                    raise IntegrityError(
-                        f"Photo download failed for source msg {message.id}"
-                    )
+                    try:
+                        try:
+                            path = await self._retry_flood_wait(
+                                lambda message=message, download_dir=download_dir: (
+                                    self.app.download_media(
+                                        message,
+                                        file_name=download_dir + os.sep,
+                                        progress=progress,
+                                    )
+                                ),
+                                message.id,
+                            )
+                        finally:
+                            progress.finish()
 
-                actual_size = os.path.getsize(path)
-                expected_size = getattr(message.photo, "file_size", None)
-                if actual_size <= 0:
-                    raise IntegrityError(
-                        f"Downloaded an empty photo for source msg {message.id}"
-                    )
-                if expected_size and actual_size != expected_size:
-                    raise IntegrityError(
-                        f"Downloaded size mismatch for source msg {message.id}: "
-                        f"expected={expected_size}, actual={actual_size}"
-                    )
+                        if not path or not os.path.isfile(path):
+                            raise IntegrityError(
+                                "Photo download failed for source msg "
+                                f"{message.id}"
+                            )
 
+                        actual_size = os.path.getsize(path)
+                        expected_size = getattr(
+                            message.photo,
+                            "file_size",
+                            None,
+                        )
+                        if actual_size <= 0:
+                            raise IntegrityError(
+                                "Downloaded an empty photo for source msg "
+                                f"{message.id}"
+                            )
+                        if expected_size and actual_size != expected_size:
+                            raise IntegrityError(
+                                "Downloaded size mismatch for source msg "
+                                f"{message.id}: expected={expected_size}, "
+                                f"actual={actual_size}"
+                            )
+                        break
+                    except (FileReferenceExpired, IntegrityError) as exc:
+                        self._remove_temp_dir(download_dir)
+                        path = None
+                        if attempt == DOWNLOAD_ATTEMPTS:
+                            raise
+                        logger.warning(
+                            "Download attempt %d/%d failed for photo in source "
+                            "msg %d: %s; removed only this photo's temporary "
+                            "files and retrying this file",
+                            attempt,
+                            DOWNLOAD_ATTEMPTS,
+                            original_message.id,
+                            exc,
+                        )
+                        message = await self._refresh_source_message(
+                            original_message.id
+                        )
+                        current_messages[index] = message
+                        await asyncio.sleep(1)
+
+                assert path is not None
                 paths.append(path)
                 media_inputs.append(
                     InputMediaPhoto(
@@ -1405,15 +1500,19 @@ class ChannelForwarder:
                         caption=message.caption or "",
                         caption_entities=message.caption_entities,
                         has_spoiler=bool(
-                            getattr(message, "has_media_spoiler", False)
+                            getattr(
+                                message,
+                                "has_media_spoiler",
+                                False,
+                            )
                         ),
                     )
                 )
 
             upload_progress = ConsoleProgress(
                 "Uploading",
-                f"photo_album_{ordered[0].media_group_id}",
-                total_items=len(ordered),
+                f"photo_album_{current_messages[0].media_group_id}",
+                total_items=len(current_messages),
             )
             try:
                 sent_messages = await self._retry_flood_wait(
@@ -1427,14 +1526,18 @@ class ChannelForwarder:
             finally:
                 upload_progress.finish()
             sent_messages = list(sent_messages or [])
-            if len(sent_messages) != len(ordered):
+            if len(sent_messages) != len(current_messages):
                 raise IntegrityError(
-                    f"Photo album {ordered[0].media_group_id} returned "
-                    f"{len(sent_messages)} of {len(ordered)} messages"
+                    f"Photo album {current_messages[0].media_group_id} returned "
+                    f"{len(sent_messages)} of {len(current_messages)} messages"
                 )
 
             state_records: list[tuple[int, int, str | None, str]] = []
-            for source, sent, path in zip(ordered, sent_messages, paths):
+            for source, sent, path in zip(
+                current_messages,
+                sent_messages,
+                paths,
+            ):
                 verification = self._validate_uploaded_file_response(
                     source,
                     sent,
