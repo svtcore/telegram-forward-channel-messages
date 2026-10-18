@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -18,8 +19,12 @@ from typing import Any, Awaitable, Callable, TypeVar
 from pyrogram import Client, enums, raw
 from pyrogram.errors import (
     ChatForwardsRestricted,
+<<<<<<< HEAD
+    FloodPremiumWait,
+=======
     FilePartMissing,
     FileReferenceExpired,
+>>>>>>> 912e0dd936475e662a54bbda1e9f93acc9a4d8a1
     FloodWait,
     RPCError,
 )
@@ -59,6 +64,13 @@ PREMIUM_UPLOAD_LIMIT_MIB = 4000
 SEVEN_ZIP_VOLUME_MIB = 1990
 DOWNLOAD_ATTEMPTS = 3
 UPLOAD_PART_ATTEMPTS = 3
+
+FLOOD_WAIT_RETRIES = 3
+FLOOD_WAIT_MARGIN_SEC = 5.0
+FLOOD_PREMIUM_MIN_WAIT_SEC = 60.0
+FLOOD_PREMIUM_WAIT_MARGIN_SEC = 30.0
+FLOOD_JITTER_MAX_SEC = 10.0
+FLOOD_WAIT_MAX_SEC = 3600.0
 
 
 def _apply_pyrofork_media_group_compatibility() -> None:
@@ -103,6 +115,10 @@ class OneTimeStrategy(str, Enum):
 
 class IntegrityError(RuntimeError):
     """Raised when a downloaded or uploaded media file fails verification"""
+
+
+class FloodRetryExhausted(RuntimeError):
+    """Raised when a flood error persists after exhausting the retry budget"""
 
 
 def _format_bytes(value: int) -> str:
@@ -837,22 +853,76 @@ class ChannelForwarder:
         }
         return f"{kind}_{msg.id}{extensions.get(kind, '')}"
 
+    @staticmethod
+    def _flood_wait_delay(exc: FloodWait, attempt: int = 0) -> float:
+        """Seconds to sleep before retrying after a flood error.
+
+        Telegram hides the real wait for FLOOD_PREMIUM_WAIT_X: the value
+        reported by the library is only a guess, so it is raised to a
+        conservative minimum and doubled on every retry attempt. Disclosed
+        waits (FLOOD_WAIT_N) are honored with a small safety margin.
+        """
+        value = getattr(exc, "value", None)
+        try:
+            seconds = float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            seconds = 0.0
+
+        if isinstance(exc, FloodPremiumWait):
+            delay = max(
+                seconds + FLOOD_PREMIUM_WAIT_MARGIN_SEC,
+                FLOOD_PREMIUM_MIN_WAIT_SEC,
+            )
+            delay *= 2 ** attempt
+        else:
+            delay = seconds + FLOOD_WAIT_MARGIN_SEC
+
+        delay += random.uniform(0, FLOOD_JITTER_MAX_SEC)
+        return min(delay, FLOOD_WAIT_MAX_SEC)
+
+    async def _sleep_flood_wait(
+        self,
+        exc: FloodWait,
+        attempt: int,
+        message_id: int,
+    ) -> None:
+        delay = self._flood_wait_delay(exc, attempt)
+        if isinstance(exc, FloodPremiumWait):
+            logger.warning(
+                "Premium upload flood on msg %d - sleeping %.0fs "
+                "(retry %d; server hid the exact wait: %s)",
+                message_id,
+                delay,
+                attempt + 1,
+                exc,
+            )
+        else:
+            logger.warning(
+                "FloodWait %.0fs - sleeping before retrying msg %d",
+                delay,
+                message_id,
+            )
+        await asyncio.sleep(delay)
+
     async def _retry_flood_wait(
         self,
         operation: Callable[[], Awaitable[T]],
         message_id: int,
     ) -> T:
+        attempt = 0
         while True:
             try:
                 return await operation()
+            except FloodPremiumWait as exc:
+                if attempt > FLOOD_WAIT_RETRIES:
+                    raise FloodRetryExhausted(
+                        f"Upload flood persists for msg {message_id} after "
+                        f"{attempt} waits: {exc}"
+                    ) from exc
+                await self._sleep_flood_wait(exc, attempt, message_id)
+                attempt += 1
             except FloodWait as exc:
-                wait = getattr(exc, "value", getattr(exc, "x", 30))
-                logger.warning(
-                    "FloodWait %ds - retrying operation for msg %d",
-                    wait,
-                    message_id,
-                )
-                await asyncio.sleep(wait)
+                await self._sleep_flood_wait(exc, 0, message_id)
 
     async def _upload_retry_file_parts(
         self,
@@ -1742,6 +1812,8 @@ class ChannelForwarder:
         forwarded = 0
         seen_groups: set[str] = set()
         for msg in candidates:
+            flood_attempts = 0
+            gave_up = False
             while True:
                 try:
                     if msg.media_group_id:
@@ -1782,11 +1854,25 @@ class ChannelForwarder:
                         self._mark_done(msg.id)
                         forwarded += 1
                     break
+                except FloodPremiumWait as exc:
+                    flood_attempts += 1
+                    if flood_attempts > FLOOD_WAIT_RETRIES:
+                        logger.error(
+                            "Upload flood persists for msg %d - stopping this "
+                            "run; unfinished messages will be retried on the "
+                            "next run",
+                            msg.id,
+                        )
+                        gave_up = True
+                        break
+                    await self._sleep_flood_wait(
+                        exc, flood_attempts - 1, msg.id,
+                    )
                 except FloodWait as exc:
-                    wait = getattr(exc, "value", getattr(exc, "x", 30))
-                    logger.warning("FloodWait %ds - retrying msg %d", wait, msg.id)
-                    await asyncio.sleep(wait)
+                    await self._sleep_flood_wait(exc, 0, msg.id)
 
+            if gave_up:
+                break
             await asyncio.sleep(0.5)
 
         return forwarded
@@ -1827,6 +1913,8 @@ class ChannelForwarder:
             ):
                 continue
 
+            flood_attempts = 0
+            gave_up = False
             while True:
                 try:
                     if msg.media_group_id:
@@ -1907,7 +1995,34 @@ class ChannelForwarder:
                         verification,
                     )
                     break
+                except FloodRetryExhausted as exc:
+                    logger.error(
+                        "Upload flood persists for msg %d - stopping this "
+                        "run; unfinished messages will be retried on the "
+                        "next run: %s",
+                        msg.id,
+                        exc,
+                    )
+                    gave_up = True
+                    break
+                except FloodPremiumWait as exc:
+                    flood_attempts += 1
+                    if flood_attempts > FLOOD_WAIT_RETRIES:
+                        logger.error(
+                            "Upload flood persists for msg %d - stopping this "
+                            "run; unfinished messages will be retried on the "
+                            "next run",
+                            msg.id,
+                        )
+                        gave_up = True
+                        break
+                    await self._sleep_flood_wait(
+                        exc, flood_attempts - 1, msg.id,
+                    )
                 except FloodWait as exc:
+<<<<<<< HEAD
+                    await self._sleep_flood_wait(exc, 0, msg.id)
+=======
                     wait = getattr(exc, "value", getattr(exc, "x", 30))
                     logger.warning("FloodWait %ds - retrying msg %d", wait, msg.id)
                     await asyncio.sleep(wait)
@@ -1918,7 +2033,10 @@ class ChannelForwarder:
                         exc,
                     )
                     break
+>>>>>>> 912e0dd936475e662a54bbda1e9f93acc9a4d8a1
 
+            if gave_up:
+                break
             await asyncio.sleep(0.5)
 
         return cloned
@@ -1994,9 +2112,9 @@ class ChannelForwarder:
                 if n:
                     logger.info("Forwarded %d new message(s)", n)
             except FloodWait as e:
-                wait = getattr(e, "value", getattr(e, "x", 30))
-                logger.warning("FloodWait %ds — sleeping", wait)
-                await asyncio.sleep(wait)
+                delay = self._flood_wait_delay(e, 0)
+                logger.warning("FloodWait %.0fs — sleeping", delay)
+                await asyncio.sleep(delay)
             except RPCError as e:
                 logger.error("Polling error: %s", e)
 
@@ -2045,10 +2163,10 @@ class ChannelForwarder:
                     self._mark_done(msg.id)
                     forwarded += 1
 
+            except FloodPremiumWait as e:
+                await self._sleep_flood_wait(e, 0, msg.id)
             except FloodWait as e:
-                wait = getattr(e, "value", getattr(e, "x", 30))
-                logger.warning("FloodWait %ds — sleeping", wait)
-                await asyncio.sleep(wait)
+                await self._sleep_flood_wait(e, 0, msg.id)
             except RPCError as e:
                 logger.error("Error processing msg %d: %s", msg.id, e)
 
