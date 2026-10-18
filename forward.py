@@ -19,12 +19,9 @@ from typing import Any, Awaitable, Callable, TypeVar
 from pyrogram import Client, enums, raw
 from pyrogram.errors import (
     ChatForwardsRestricted,
-<<<<<<< HEAD
-    FloodPremiumWait,
-=======
     FilePartMissing,
     FileReferenceExpired,
->>>>>>> 912e0dd936475e662a54bbda1e9f93acc9a4d8a1
+    FloodPremiumWait,
     FloodWait,
     RPCError,
 )
@@ -2020,12 +2017,7 @@ class ChannelForwarder:
                         exc, flood_attempts - 1, msg.id,
                     )
                 except FloodWait as exc:
-<<<<<<< HEAD
                     await self._sleep_flood_wait(exc, 0, msg.id)
-=======
-                    wait = getattr(exc, "value", getattr(exc, "x", 30))
-                    logger.warning("FloodWait %ds - retrying msg %d", wait, msg.id)
-                    await asyncio.sleep(wait)
                 except (RPCError, IntegrityError) as exc:
                     logger.error(
                         "Skipping source msg %d after persistent failure: %s",
@@ -2033,7 +2025,6 @@ class ChannelForwarder:
                         exc,
                     )
                     break
->>>>>>> 912e0dd936475e662a54bbda1e9f93acc9a4d8a1
 
             if gave_up:
                 break
