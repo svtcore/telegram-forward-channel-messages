@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 from pyrogram import Client, enums, raw
 from pyrogram.errors import (
     ChatForwardsRestricted,
+    FilePartMissing,
     FileReferenceExpired,
     FloodWait,
     RPCError,
@@ -57,6 +58,7 @@ STANDARD_UPLOAD_LIMIT_MIB = 2000
 PREMIUM_UPLOAD_LIMIT_MIB = 4000
 SEVEN_ZIP_VOLUME_MIB = 1990
 DOWNLOAD_ATTEMPTS = 3
+UPLOAD_PART_ATTEMPTS = 3
 
 
 def _apply_pyrofork_media_group_compatibility() -> None:
@@ -852,6 +854,34 @@ class ChannelForwarder:
                 )
                 await asyncio.sleep(wait)
 
+    async def _upload_retry_file_parts(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        message_id: int,
+    ) -> T:
+        """Retry an upload when Telegram loses parts of its upload session.
+
+        FILE_PART_X_MISSING is reported before anything is published to the
+        destination, so re-sending the same local files is safe and starts a
+        fresh upload session
+        """
+        for attempt in range(1, UPLOAD_PART_ATTEMPTS + 1):
+            try:
+                return await self._retry_flood_wait(operation, message_id)
+            except FilePartMissing as exc:
+                if attempt == UPLOAD_PART_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Upload attempt %d/%d failed for source msg %d: %s; "
+                    "retrying the upload with the same local files",
+                    attempt,
+                    UPLOAD_PART_ATTEMPTS,
+                    message_id,
+                    exc,
+                )
+                await asyncio.sleep(3)
+        raise AssertionError("unreachable")
+
     async def _refresh_source_message(self, message_id: int) -> Message:
         """Fetch a fresh message containing a current Telegram file reference."""
         message = await self._retry_flood_wait(
@@ -1099,7 +1129,7 @@ class ChannelForwarder:
             for volume in volumes
         ]
 
-        sent_messages = await self._retry_flood_wait(
+        sent_messages = await self._upload_retry_file_parts(
             lambda: self._send_document_volume_group(msg, volumes),
             msg.id,
         )
@@ -1311,6 +1341,7 @@ class ChannelForwarder:
                     "Downloading",
                     self._media_display_name(current_msg, kind, current_media),
                 )
+                # Download phase; retried within this loop on reference errors
                 try:
                     try:
                         path = await self._retry_flood_wait(
@@ -1338,7 +1369,6 @@ class ChannelForwarder:
                             f"Downloaded size mismatch for source msg {msg.id}: "
                             f"expected={expected_size}, actual={actual_size}"
                         )
-                    break
                 except (FileReferenceExpired, IntegrityError) as exc:
                     self._remove_temp_dir(temp_dir)
                     temp_dir = None
@@ -1358,45 +1388,66 @@ class ChannelForwarder:
                     # manifests, so refresh after either retryable failure.
                     current_msg = await self._refresh_source_message(msg.id)
                     await asyncio.sleep(1)
+                    continue
 
-            assert temp_dir is not None and path is not None
-
-            logger.info(
-                "Downloaded msg %d (%d bytes)",
-                msg.id,
-                actual_size,
-            )
-            if kind == "document" and actual_size > self._upload_limit_bytes:
-                sent, verification = await self._clone_oversized_document(
-                    current_msg,
-                    path,
-                    actual_size,
-                    temp_dir,
-                )
-            else:
-                sent = await self._retry_flood_wait(
-                    lambda: self._send_local_file(current_msg, kind, path),
-                    msg.id,
-                )
-                verification = self._validate_uploaded_file_response(
-                    current_msg,
-                    sent,
-                    kind,
-                    actual_size,
-                )
-                os.remove(path)
                 logger.info(
-                    "Removed local file for source msg %d after upload",
+                    "Downloaded msg %d (%d bytes)",
                     msg.id,
+                    actual_size,
                 )
-            
-            self._record_verified_clone(
-                msg.id,
-                sent.id,
-                None,
-                verification,
-            )
-            return sent, verification
+
+                # Upload phase. FILE_PART_X_MISSING is retried first with the
+                # existing local files; if it persists, the whole pipeline is
+                # restarted from scratch
+                try:
+                    if kind == "document" and actual_size > self._upload_limit_bytes:
+                        sent, verification = await self._clone_oversized_document(
+                            current_msg,
+                            path,
+                            actual_size,
+                            temp_dir,
+                        )
+                    else:
+                        sent = await self._upload_retry_file_parts(
+                            lambda: self._send_local_file(current_msg, kind, path),
+                            msg.id,
+                        )
+                        verification = self._validate_uploaded_file_response(
+                            current_msg,
+                            sent,
+                            kind,
+                            actual_size,
+                        )
+                        os.remove(path)
+                        logger.info(
+                            "Removed local file for source msg %d after upload",
+                            msg.id,
+                        )
+                except FilePartMissing as exc:
+                    self._remove_temp_dir(temp_dir)
+                    temp_dir = None
+                    path = None
+                    if attempt == DOWNLOAD_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "Upload attempts exhausted for source msg %d: %s; "
+                        "removed all local files (7-Zip volumes and the "
+                        "downloaded original) and restarting from scratch: "
+                        "re-download, re-split, re-upload",
+                        msg.id,
+                        exc,
+                    )
+                    current_msg = await self._refresh_source_message(msg.id)
+                    await asyncio.sleep(5)
+                    continue
+
+                self._record_verified_clone(
+                    msg.id,
+                    sent.id,
+                    None,
+                    verification,
+                )
+                return sent, verification
         finally:
             if temp_dir is not None:
                 self._remove_temp_dir(temp_dir)
@@ -1509,22 +1560,25 @@ class ChannelForwarder:
                     )
                 )
 
-            upload_progress = ConsoleProgress(
-                "Uploading",
-                f"photo_album_{current_messages[0].media_group_id}",
-                total_items=len(current_messages),
-            )
-            try:
-                sent_messages = await self._retry_flood_wait(
-                    lambda: self.app.send_media_group(
+            async def _send_album() -> list[Message]:
+                progress = ConsoleProgress(
+                    "Uploading",
+                    f"photo_album_{current_messages[0].media_group_id}",
+                    total_items=len(current_messages),
+                )
+                try:
+                    return await self.app.send_media_group(
                         self._dest_id,
                         media_inputs,
-                        progress=upload_progress,
-                    ),
-                    ordered[0].id,
-                )
-            finally:
-                upload_progress.finish()
+                        progress=progress,
+                    )
+                finally:
+                    progress.finish()
+
+            sent_messages = await self._upload_retry_file_parts(
+                _send_album,
+                ordered[0].id,
+            )
             sent_messages = list(sent_messages or [])
             if len(sent_messages) != len(current_messages):
                 raise IntegrityError(
@@ -1857,6 +1911,13 @@ class ChannelForwarder:
                     wait = getattr(exc, "value", getattr(exc, "x", 30))
                     logger.warning("FloodWait %ds - retrying msg %d", wait, msg.id)
                     await asyncio.sleep(wait)
+                except (RPCError, IntegrityError) as exc:
+                    logger.error(
+                        "Skipping source msg %d after persistent failure: %s",
+                        msg.id,
+                        exc,
+                    )
+                    break
 
             await asyncio.sleep(0.5)
 
